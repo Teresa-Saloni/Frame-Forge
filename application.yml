@@ -1,0 +1,31 @@
+server:
+  port: 8090
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+frameforge:
+  raw-bucket: raw-video
+  topic: video.ingested
+  poll-ms: 5000
+  watermark-file: /data/watermark.txt
+  s3:
+    endpoint: ${S3_ENDPOINT:http://localhost:9000}
+    access-key: ${AWS_ACCESS_KEY_ID:minioadmin}
+    secret-key: ${AWS_SECRET_ACCESS_KEY:minioadmin}
+    region: ${AWS_REGION:us-east-1}
+  kafka:
+    bootstrap: ${KAFKA_BOOTSTRAP:localhost:29092}
+  airflow:
+    url: ${AIRFLOW_URL:http://localhost:8088}
+    user: ${AIRFLOW_USER:admin}
+    password: ${AIRFLOW_PASSWORD:admin}
+    dag-id: frameforge_video
+
+logging:
+  level:
+    com.frameforge: INFO
+    org.apache.kafka: WARN

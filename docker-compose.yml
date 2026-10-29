@@ -1,0 +1,193 @@
+name: frameforge
+
+x-aws-env: &aws-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+
+services:
+
+  # ---------- storage ----------
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------- events ----------
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_CFG_NODE_ID: 0
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports: ["29092:29092"]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ---------- metadata ----------
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ff
+      POSTGRES_PASSWORD: ff
+      POSTGRES_DB: ff
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ff"]
+      interval: 5s
+      retries: 20
+
+  # ---------- lakehouse catalog ----------
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    environment:
+      <<: *aws-env
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg
+      CATALOG_JDBC_USER: ff
+      CATALOG_JDBC_PASSWORD: ff
+    ports: ["8181:8181"]
+    depends_on:
+      minio: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+
+  # ---------- compute ----------
+  spark-master:
+    image: bitnami/spark:3.5.3
+    environment:
+      <<: *aws-env
+      SPARK_MODE: master
+    ports: ["8080:8080", "7077:7077"]
+    volumes:
+      - ./spark-jobs/target:/opt/jobs:ro
+      - ./models:/opt/models:ro
+      - ./spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+
+  spark-worker:
+    image: bitnami/spark:3.5.3
+    environment:
+      <<: *aws-env
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 4
+    volumes:
+      - ./spark-jobs/target:/opt/jobs:ro
+      - ./models:/opt/models:ro
+      - ./spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+    depends_on: [spark-master]
+
+  # ---------- orchestration ----------
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    environment:
+      <<: *aws-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://ff:ff@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type":"http","url":"http://marquez:5000"}'
+      AIRFLOW__OPENLINEAGE__NAMESPACE: frameforge
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    ports: ["8088:8080"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./quality:/opt/quality:ro
+      - ./spark-jobs/target:/opt/jobs:ro
+      - ./models:/opt/models:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      iceberg-rest: {condition: service_started}
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin --firstname a --lastname d --role Admin --email admin@example.com || true &&
+               airflow connections add spark_default --conn-type spark --conn-host spark://spark-master --conn-port 7077 || true &&
+               (airflow scheduler &) && exec airflow webserver"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  # ---------- ingest ----------
+  ingest-service:
+    build:
+      context: .
+      dockerfile: ingest-service/Dockerfile
+    environment:
+      <<: *aws-env
+      S3_ENDPOINT: http://minio:9000
+      KAFKA_BOOTSTRAP: kafka:9092
+      AIRFLOW_URL: http://airflow:8080
+      AIRFLOW_USER: admin
+      AIRFLOW_PASSWORD: admin
+    ports: ["8090:8090"]
+    depends_on:
+      minio: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      airflow: {condition: service_healthy}
+
+  # ---------- serving ----------
+  trino:
+    image: trinodb/trino:460
+    ports: ["8085:8080"]
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    depends_on: [iceberg-rest]
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      retries: 20
+
+  # ---------- lineage ----------
+  marquez:
+    image: marquezproject/marquez:0.49.0
+    environment:
+      MARQUEZ_CONFIG: /usr/src/app/marquez.yml
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: marquez
+      POSTGRES_USER: ff
+      POSTGRES_PASSWORD: ff
+    ports: ["5000:5000", "5001:5001"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.49.0
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: 5000
+    ports: ["3000:3000"]
+    depends_on: [marquez]
+
+volumes:
+  minio-data:
+  pg-data:

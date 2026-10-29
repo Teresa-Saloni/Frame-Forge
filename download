@@ -1,0 +1,14 @@
+target/
+*.jar
+!spark-jobs/target/.keep
+models/*.onnx
+models/*.pt
+samples/*.mp4
+airflow/logs/
+quality/gx/uncommitted/
+__pycache__/
+*.pyc
+.idea/
+*.iml
+.vscode/
+.DS_Store

@@ -1,0 +1,16 @@
+# Multi-stage: build with Maven, run on a slim JRE. Context is the repo root.
+FROM maven:3.9-eclipse-temurin-17 AS build
+WORKDIR /src
+COPY pom.xml .
+COPY ingest-service/pom.xml ingest-service/
+COPY spark-jobs/pom.xml spark-jobs/
+RUN mvn -q -pl ingest-service -am dependency:go-offline
+COPY ingest-service/src ingest-service/src
+RUN mvn -q -pl ingest-service -am package -DskipTests
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+VOLUME /data
+COPY --from=build /src/ingest-service/target/ingest-service.jar app.jar
+EXPOSE 8090
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
